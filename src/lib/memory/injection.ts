@@ -120,6 +120,61 @@ export interface InjectMemoryOptions {
   systemMessageMustBeFirst?: boolean;
 }
 
+/**
+ * Resolve injection for strict providers that require system messages at index 0.
+ * Merges memory into an existing system[0] or unshifts to front.
+ */
+function resolveStrictSystemInjection(
+  messages: ChatMessage[],
+  memorySystemMessage: ChatMessage,
+  memoryText: string,
+  memories: Memory[],
+  request: ChatRequest
+): ChatRequest {
+  const firstSystemIdx = messages.findIndex((m) => m.role === "system");
+  if (firstSystemIdx === 0) {
+    const merged = [
+      { ...messages[0], content: `${memoryText}\n\n${messages[0].content}` },
+      ...messages.slice(1),
+    ];
+    log.info("memory.injection.injected", {
+      count: memories.length,
+      strategy: "system-strict-merge",
+      model: request.model,
+    });
+    return { ...request, messages: merged };
+  }
+  log.info("memory.injection.injected", {
+    count: memories.length,
+    strategy: "system-strict-unshift",
+    model: request.model,
+  });
+  return { ...request, messages: [memorySystemMessage, ...messages] };
+}
+
+/**
+ * Resolve injection for the user-message fallback path.
+ */
+function resolveUserFallbackInjection(
+  messages: ChatMessage[],
+  memoryUserMessage: ChatMessage,
+  memories: Memory[],
+  request: ChatRequest,
+  cacheSafeIndex: number
+): ChatRequest {
+  log.info("memory.injection.injected", {
+    count: memories.length,
+    strategy: cacheSafeIndex >= 0 ? "user-cache-safe" : "user",
+    model: request.model,
+  });
+  if (cacheSafeIndex >= 0) {
+    const next = [...messages];
+    next.splice(cacheSafeIndex, 0, memoryUserMessage);
+    return { ...request, messages: next };
+  }
+  return { ...request, messages: [memoryUserMessage, ...messages] };
+}
+
 export function injectMemory(
   request: ChatRequest,
   memories: Memory[],
@@ -154,30 +209,13 @@ export function injectMemory(
     const memorySystemMessage: ChatMessage = { role: "system", content: memoryText };
 
     if (isStrictSystem) {
-      // Strict provider: system message must be at index 0.
-      // If an existing system message exists at index 0, merge memory into it.
-      // Otherwise, unshift the memory system message to index 0.
-      const firstSystemIdx = messages.findIndex((m) => m.role === "system");
-      if (firstSystemIdx === 0) {
-        // Merge memory context into the existing system message at index 0.
-        const merged = [
-          { ...messages[0], content: `${memoryText}\n\n${messages[0].content}` },
-          ...messages.slice(1),
-        ];
-        log.info("memory.injection.injected", {
-          count: memories.length,
-          strategy: "system-strict-merge",
-          model: request.model,
-        });
-        return { ...request, messages: merged };
-      }
-      // No system message at index 0 — unshift memory to front.
-      log.info("memory.injection.injected", {
-        count: memories.length,
-        strategy: "system-strict-unshift",
-        model: request.model,
-      });
-      return { ...request, messages: [memorySystemMessage, ...messages] };
+      return resolveStrictSystemInjection(
+        messages,
+        memorySystemMessage,
+        memoryText,
+        memories,
+        request
+      );
     }
 
     // Lenient path: cache-safe splices before last user, otherwise unshifts to front.
@@ -193,20 +231,14 @@ export function injectMemory(
     }
     return { ...request, messages: [memorySystemMessage, ...messages] };
   } else {
-    // Strategy 2 (fallback): inject as a user message.
-    // Used for providers like o1-mini that reject the system role.
     const memoryUserMessage: ChatMessage = { role: "user", content: memoryText };
-    log.info("memory.injection.injected", {
-      count: memories.length,
-      strategy: cacheSafeIndex >= 0 ? "user-cache-safe" : "user",
-      model: request.model,
-    });
-    if (cacheSafeIndex >= 0) {
-      const next = [...messages];
-      next.splice(cacheSafeIndex, 0, memoryUserMessage);
-      return { ...request, messages: next };
-    }
-    return { ...request, messages: [memoryUserMessage, ...messages] };
+    return resolveUserFallbackInjection(
+      messages,
+      memoryUserMessage,
+      memories,
+      request,
+      cacheSafeIndex
+    );
   }
 }
 
