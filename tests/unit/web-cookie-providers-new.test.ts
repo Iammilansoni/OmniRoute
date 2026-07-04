@@ -749,18 +749,16 @@ test("Doubao Web: error response returns error result", async () => {
 
 // ── Cookie Normalization Tests ───────────────────────────────────────────────
 
-test("All executors handle Cookie prefix and bare cookie values", async () => {
-  const executors = [
-    new HuggingChatExecutor(),
-    new PoeWebExecutor(),
-    new VeniceWebExecutor(),
-    new V0VercelWebExecutor(),
-    new KimiWebExecutor(),
-    new DoubaoWebExecutor(),
-  ];
+const ALL_WEB_EXECUTORS = [
+  new HuggingChatExecutor(),
+  new PoeWebExecutor(),
+  new VeniceWebExecutor(),
+  new V0VercelWebExecutor(),
+  new KimiWebExecutor(),
+  new DoubaoWebExecutor(),
+];
 
-  const credentialCases = ["Cookie: test=value", "bare-cookie-value"];
-
+test("All executors handle Cookie: prefix", async () => {
   const original = globalThis.fetch;
   let lastHeaders: Record<string, string> = {};
   globalThis.fetch = async (_url: any, opts: any) => {
@@ -773,15 +771,39 @@ test("All executors handle Cookie prefix and bare cookie values", async () => {
   };
 
   try {
-    for (const apiKey of credentialCases) {
-      for (const executor of executors) {
-        await executor.execute({
-          ...noopExecuteInput,
-          credentials: { apiKey },
-          stream: false,
-        });
-        assert.ok(lastHeaders.Cookie || lastHeaders.Authorization || lastHeaders["Content-Type"]);
-      }
+    for (const executor of ALL_WEB_EXECUTORS) {
+      await executor.execute({
+        ...noopExecuteInput,
+        credentials: { apiKey: "Cookie: test=value" },
+        stream: false,
+      });
+      assert.ok(lastHeaders.Cookie || lastHeaders.Authorization || lastHeaders["Content-Type"]);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("All executors handle bare cookie value", async () => {
+  const original = globalThis.fetch;
+  let lastHeaders: Record<string, string> = {};
+  globalThis.fetch = async (_url: any, opts: any) => {
+    lastHeaders = opts?.headers || {};
+    const body = JSON.stringify({ data: { chatWithBot: { text: "ok" } } });
+    return new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    for (const executor of ALL_WEB_EXECUTORS) {
+      await executor.execute({
+        ...noopExecuteInput,
+        credentials: { apiKey: "bare-cookie-value" },
+        stream: false,
+      });
+      assert.ok(lastHeaders["Content-Type"]);
     }
   } finally {
     globalThis.fetch = original;
