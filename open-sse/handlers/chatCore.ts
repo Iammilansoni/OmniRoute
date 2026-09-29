@@ -142,6 +142,7 @@ import {
   injectSystemPromptPostTranslation,
   injectSystemPromptPreTranslation,
 } from "../services/systemPrompt.ts";
+import { applyProviderSystemTransforms } from "../services/systemTransforms.ts";
 import { translateRequest, needsTranslation } from "../translator/index.ts";
 import { applyReasoningRuleDirective } from "@/lib/reasoningRouting/policy";
 import { withReasoningRuleContext } from "../utils/reasoningRuleContext.ts";
@@ -156,6 +157,7 @@ import {
   COLORS,
 } from "../utils/stream.ts";
 import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
+import { requestTtftMs } from "../utils/streamTiming.ts";
 import { resolveSuppressThinkClose, THINKING_MARKER_HEADER } from "../utils/thinkCloseMarker.ts";
 import { resolveStreamReadinessTimeout } from "../utils/streamReadinessPolicy.ts";
 import { resolveAgentGoalPolicy } from "../utils/agentGoalPolicy.ts";
@@ -334,6 +336,7 @@ import { recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats.
 import {
   normalizeExecutorResult,
   executeWithUpstreamStartTimeout,
+  getExecutorTimeoutMs,
   resolveConnectionTimeoutMs,
 } from "./chatCore/upstreamTimeouts.ts";
 import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/db/models";
@@ -2287,6 +2290,28 @@ async function handleChatCoreInner({
   body = outputBudget.body;
 
   let translatedBody = body;
+
+  // Per-provider system transforms for providers whose executor does not run the
+  // pipeline itself (issue #2260 v2 documents the DSL as covering "any other
+  // provider key", but only the Claude-native and CC-bridge wire paths ever
+  // called it). Applied on the client-shaped body before translation, so the
+  // configured ops see the messages[]/system shape the Settings UI documents.
+  // `applyProviderSystemTransforms` is a no-op for the claude / CC-bridge keys,
+  // which already apply the same config downstream inside their executors.
+  {
+    const systemTransformResult = applyProviderSystemTransforms(
+      provider,
+      translatedBody as Record<string, unknown>
+    );
+    if (systemTransformResult.appliedOpKinds.length > 0) {
+      translatedBody = systemTransformResult.body as typeof translatedBody;
+      log?.debug?.(
+        "SYSTRANSFORMS",
+        `${provider}: ${systemTransformResult.appliedOpKinds.join(", ")}`
+      );
+    }
+  }
+
   const isClaudePassthrough = sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE;
   const isClaudeCodeCompatible = usesClaudeBridge(provider, targetFormat, credentials);
   const isClaudeCodeSemanticPassthrough = isClaudeCodeSemanticPassthroughRequest({
@@ -3247,6 +3272,20 @@ async function handleChatCoreInner({
               const res = normalizeExecutorResult(rawExecutorResult);
               trace("post_executor", { status: res?.response?.status });
 
+              // When a payload override rewrote body.model (custom-model alias →
+              // real upstream id, e.g. `gemini-3.7-flash-high` → `gemini-3.7-flash`),
+              // log and track the WIRE model so dashboards/telemetry reflect what
+              // actually shipped and Gemini rate-limit accounting uses the real id
+              // (the executor already built its URL from the same rewritten model).
+              const wireModel =
+                typeof res.model === "string" && res.model ? res.model : modelToCall;
+              if (wireModel !== modelToCall) {
+                log?.debug?.(
+                  "PAYLOAD_RULES",
+                  `Payload rules rewrote model for URL: requested=${modelToCall} wire=${wireModel}`
+                );
+              }
+
               if (
                 provider === "codex" &&
                 attemptConnectionId &&
@@ -3284,7 +3323,7 @@ async function handleChatCoreInner({
 
               // Track Gemini RPM + RPD request counts for 429 classification
               if (provider === "gemini") {
-                incrementRequestCount(modelToCall);
+                incrementRequestCount(wireModel);
               }
 
               updatePendingScope(pendingScope, {
@@ -5793,6 +5832,12 @@ async function handleChatCoreInner({
     maxTimeoutMs: agentGoalPolicy.detected
       ? Math.max(STREAM_READINESS_MAX_TIMEOUT_MS, agentGoalPolicy.readinessMaxTimeoutMs)
       : STREAM_READINESS_MAX_TIMEOUT_MS,
+    cascadeTimeoutMs: getExecutorTimeoutMs(
+      executor,
+      provider,
+      model,
+      resolveConnectionTimeoutMs(credentials?.providerSpecificData)
+    ),
   });
   if (streamReadinessPolicy.timeoutMs !== streamReadinessPolicy.baseTimeoutMs) {
     log?.debug?.(
@@ -5875,9 +5920,9 @@ async function handleChatCoreInner({
   // issue bounded retries through the normal credential path BEFORE anything is
   // exposed to the client — in particular before `onRequestSuccess` below.
   // Empty turns are stochastic upstream misses, not account faults, so no
-  // cooldown and no forced exclusion: the round-robin picker may rotate
-  // fingerprint slots opportunistically, a single slot simply replays the same
-  // account. Budget: `STREAM_RECOVERY.EMPTY_TURN_RETRY_MAX` retries, then fall
+  // cooldown: the retry prefers another allowed connection, a single slot
+  // replays itself, and a leased or pinned connection never rotates (#14715).
+  // Budget: `STREAM_RECOVERY.EMPTY_TURN_RETRY_MAX` retries, then fall
   // back to the current behavior. Translate-path streams only (mirror of the
   // empty-stream guard); flag off = byte-for-byte unchanged. Bounded reader
   // (abandon past the cap, never a full `text()` read); the original
@@ -5916,6 +5961,7 @@ async function handleChatCoreInner({
         traceId,
         log,
         getProviderCredentials,
+        routing: { leased: Boolean(managedLease), forcedConnectionId, apiKey: apiKeyInfo },
         executeProviderRequest,
         logTargetRequest: (url, headers, body) => reqLogger.logTargetRequest(url, headers, body),
         captureBody: (body) => providerRequestCapture.body(body),
@@ -5965,6 +6011,7 @@ async function handleChatCoreInner({
   let streamFailureCompletionRecorded = false;
 
   // Callback to save call log when stream completes (include responseBody when provided by stream)
+  let streamTimingOriginOffsetMs: number | null = null; // startTime → StreamTiming start
   const onStreamComplete = ({
     status: streamStatus,
     usage: streamUsage,
@@ -5974,10 +6021,11 @@ async function handleChatCoreInner({
     reasoningMeta: streamReasoningMeta,
     error: streamError,
     errorCode: streamErrorCode,
-    ttft,
+    firstOutputMs,
     itlMs: streamItlMs,
     interrupted: _streamInterrupted,
   }) => {
+    const ttft = requestTtftMs(streamTimingOriginOffsetMs, firstOutputMs);
     const normalizedStreamStatus = streamStatus || 200;
     if (streamCompletionRecorded) return;
     streamCompletionRecorded = true;
@@ -6124,6 +6172,9 @@ async function handleChatCoreInner({
       claudeCacheMeta: claudePromptCacheLogMeta,
       claudeCacheUsageMeta: cacheUsageLogMeta,
       cacheSource: "upstream",
+      // #13130: persist TTFT so call_logs.ttft_ms lets the dashboard compute
+      // generation-time TPS instead of wall-clock TPS.
+      ttft,
       reasoningMeta: streamReasoningMeta ?? null,
     });
 
@@ -6251,6 +6302,7 @@ async function handleChatCoreInner({
   // DSML tool-call markers as plain text → incomplete `stop` finish).
   const requestedThinking = hasActiveClaudeThinking((body ?? {}) as Record<string, unknown>);
 
+  streamTimingOriginOffsetMs = Date.now() - startTime;
   if (needsResponsesTranslation) {
     // Provider returns openai-responses, translate to openai (Chat Completions) that clients expect
     log?.debug?.("STREAM", `Responses translation mode: openai-responses → openai`);
