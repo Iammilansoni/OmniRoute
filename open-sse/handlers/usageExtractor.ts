@@ -10,6 +10,8 @@ export function extractUsageFromResponse(responseBody, provider) {
   const isClaudeProvider =
     providerId === "claude" ||
     providerId === "anthropic" ||
+    providerId === "vertex" ||
+    providerId === "vertex-partner" ||
     providerId.startsWith("anthropic-compatible");
 
   // OpenAI format (has prompt_tokens / completion_tokens)
@@ -106,7 +108,11 @@ export function extractUsageFromResponse(responseBody, provider) {
         responsesUsage.input_tokens_details?.cached_tokens ??
         responsesUsage.prompt_tokens_details?.cached_tokens ??
         responsesUsage.cache_read_input_tokens,
-      cache_creation_input_tokens: responsesUsage.cache_creation_input_tokens,
+      cache_creation_input_tokens:
+        responsesUsage.cache_creation_input_tokens ??
+        responsesUsage.input_tokens_details?.cache_creation_tokens ??
+        responsesUsage.prompt_tokens_details?.cache_creation_tokens ??
+        responsesUsage.cache_write_tokens,
       reasoning_tokens:
         responsesUsage.output_tokens_details?.reasoning_tokens ??
         responsesUsage.completion_tokens_details?.reasoning_tokens ??
